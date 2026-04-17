@@ -19,13 +19,11 @@ export function AuthDialog({ open, onOpenChange, onAuthSuccess }: AuthDialogProp
     setIsLoading(true)
     
     try {
-      const user = await window.spark.user()
-      
       const mockProfile: UserProfile = {
-        id: user?.id?.toString() || `user_${Date.now()}`,
-        email: user?.email || `${provider}@example.com`,
-        displayName: user?.login || `${provider} User`,
-        photoUrl: user?.avatarUrl,
+        id: `user_${Date.now()}`,
+        email: `${provider}@example.com`,
+        displayName: `${provider} User`,
+        photoUrl: undefined,
         authProvider: provider,
         createdAt: Date.now(),
         lastLogin: Date.now()

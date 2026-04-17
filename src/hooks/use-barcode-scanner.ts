@@ -1,4 +1,5 @@
 import { useEffect, useRef, RefObject } from 'react'
+import { BarcodeDetector } from 'barcode-detector'
 
 interface UseBarcodeScannerOptions {
   videoRef: RefObject<HTMLVideoElement | null>
@@ -6,15 +7,9 @@ interface UseBarcodeScannerOptions {
   onError: (error: string) => void
 }
 
-declare global {
-  interface Window {
-    BarcodeDetector?: any
-  }
-}
-
 export function useBarcodeScanner({ videoRef, onDetected, onError }: UseBarcodeScannerOptions) {
   const scanningRef = useRef(false)
-  const detectorRef = useRef<any>(null)
+  const detectorRef = useRef<BarcodeDetector | null>(null)
   const animationFrameRef = useRef<number | null>(null)
 
   const scanFrame = async () => {
@@ -44,21 +39,17 @@ export function useBarcodeScanner({ videoRef, onDetected, onError }: UseBarcodeS
 
   const startScanning = async () => {
     try {
-      if ('BarcodeDetector' in window) {
-        if (!detectorRef.current) {
-          detectorRef.current = new (window as any).BarcodeDetector({
-            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39']
-          })
-        }
-
-        scanningRef.current = true
-        scanFrame()
-      } else {
-        onError('Barcode scanning not supported on this browser. Try using Chrome on Android or use manual barcode entry.')
+      if (!detectorRef.current) {
+        detectorRef.current = new BarcodeDetector({
+          formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39']
+        })
       }
+
+      scanningRef.current = true
+      scanFrame()
     } catch (error) {
       console.error('Failed to initialize barcode detector:', error)
-      onError('Barcode scanning not supported on this device')
+      onError('Failed to initialize barcode scanner. Please use manual barcode entry.')
     }
   }
 

@@ -1,13 +1,212 @@
 import type { ProductAnalysis, Ingredient, DietaryType, IngredientSource, SafetyLevel, Alternative } from './types'
+import { isAIEnabled, smartSearchQuery } from './ai'
 
-const OPEN_FOOD_FACTS_API = 'https://world.openfoodfacts.org/api/v2'
+const OPEN_FOOD_FACTS_API = '/api/off/api/v2'
+const OPEN_FOOD_FACTS_DIRECT = 'https://world.openfoodfacts.org'
+const SEARCH_FIELDS = 'code,product_name,product_name_en,brands,categories,categories_tags_en,ingredients_text,ingredients_text_en,ingredients,nutriscore_grade,image_url,nutriments,additives_tags,allergens'
+const SUGGEST_FIELDS = 'product_name,product_name_en,brands,image_url,code'
+
+/**
+ * Search with multiple fallbacks: proxy v2 → proxy cgi → direct v2 → direct cgi
+ */
+async function searchOpenFoodFacts(query: string, fields: string, pageSize: number): Promise<any> {
+  const encodedQuery = encodeURIComponent(query)
+  
+  const urls = [
+    // 1. Proxy → v2 API
+    `${OPEN_FOOD_FACTS_API}/search?search_terms=${encodedQuery}&page_size=${pageSize}&lc=en&fields=${fields}`,
+    // 2. Proxy → cgi search
+    `/api/off/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=${pageSize}&json=true&lc=en&fields=${fields}`,
+    // 3. Direct → v2 API (CORS may block but works in some browsers)
+    `${OPEN_FOOD_FACTS_DIRECT}/api/v2/search?search_terms=${encodedQuery}&page_size=${pageSize}&lc=en&fields=${fields}`,
+    // 4. Direct → cgi search
+    `${OPEN_FOOD_FACTS_DIRECT}/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=${pageSize}&json=true&lc=en&fields=${fields}`,
+  ]
+  
+  for (const url of urls) {
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 8000)
+      
+      const response = await fetch(url, { signal: controller.signal })
+      clearTimeout(timeout)
+      
+      if (response.ok) {
+        const data = await response.json()
+        // v2 API sometimes returns all products — check count is reasonable
+        if (data.count < 100000 && data.products?.length > 0) {
+          return data
+        }
+        // If products exist but count is too high, data is still usable
+        if (data.products?.length > 0) {
+          return data
+        }
+      }
+    } catch {
+      // Try next URL
+    }
+  }
+  
+  return { products: [] }
+}
+
+/**
+ * Check if a product name looks English (basic Latin characters only)
+ */
+function isEnglishName(name: string): boolean {
+  if (!name) return false
+  // Reject names with non-Latin scripts (Cyrillic, Arabic, CJK, Thai, Devanagari, etc.)
+  if (/[\u0400-\u04FF\u0600-\u06FF\u3000-\u9FFF\uAC00-\uD7AF\u0E00-\u0E7F\u0900-\u097F\u0590-\u05FF]/.test(name)) return false
+  // Reject names with accented characters (strong signal of non-English)
+  const accentedCount = (name.match(/[àâäéèêëïîôùûüÿçæœñáíóúãõèéêë]/gi) || []).length
+  if (accentedCount > 0 && accentedCount > name.length * 0.08) return false
+  // Reject names containing common non-English food/product words
+  const lower = name.toLowerCase()
+  const nonEnglishWords = [
+    // French
+    'sans', 'sucres', 'avec', 'goût', 'gout', 'saveur', 'boisson', 'fromage',
+    'sucré', 'sucre', 'lait', 'fraise', 'pomme', 'eau', 'jus', 'blanc',
+    'naturelle', 'minérale', 'minerale', 'crème', 'creme', 'beurre', 'confiture',
+    'pâte', 'pate', 'tartiner', 'chocolat au', 'yaourt', 'yaourts',
+    // German
+    'und', 'mit', 'ohne', 'zucker', 'milch', 'wasser', 'sahne',
+    // Spanish
+    'azúcar', 'azucar', 'leche', 'sabor', 'bebida', 'galletas',
+    // Italian
+    'senza', 'zucchero', 'latte', 'acqua', 'gusto', 'formaggio',
+    // Portuguese
+    'açúcar', 'açucar', 'leite', 'sabores',
+    // Arabic transliterated
+    'halal', 'sidi',
+  ]
+  const wordMatches = nonEnglishWords.filter(w => {
+    // Match as whole word or at word boundary
+    const regex = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    return regex.test(lower)
+  }).length
+  if (wordMatches >= 1) return false
+  return true
+}
+
+/**
+ * Normalize brand name: treat "Coke", "Coca-Cola", "Coca Cola" etc. as same brand
+ */
+const BRAND_ALIASES: Record<string, string> = {
+  'coke': 'coca-cola', 'coca cola': 'coca-cola', 'coca-cola': 'coca-cola',
+  'coke zero': 'coca-cola', 'coke zéro®': 'coca-cola', 'coke zéro': 'coca-cola',
+  'pepsi': 'pepsico', 'pepsi cola': 'pepsico', 'pepsico': 'pepsico',
+  'lays': 'frito-lay', "lay's": 'frito-lay', 'frito-lay': 'frito-lay',
+  'nestle': 'nestlé', 'nestlé': 'nestlé',
+}
+
+function normalizeBrand(brand: string): string {
+  const lower = brand.toLowerCase().trim()
+  return BRAND_ALIASES[lower] || lower
+}
+
+/**
+ * Normalize product name for deduplication: strip sizes, weights, volumes
+ * Returns a key like "brand|product-flavour" for grouping
+ */
+function normalizeProductKey(name: string, brand: string): string {
+  const normalized = name
+    .toLowerCase()
+    // Remove sizes/weights: 500ml, 1.5l, 330g, 12oz, 1kg, etc.
+    .replace(/\b\d+(\.\d+)?\s*(ml|l|cl|dl|g|kg|oz|fl\.?\s*oz|liter|litre|gram|kilogram|ounce|lb|lbs|mg)\b/gi, '')
+    // Remove pack sizes: 6-pack, x12, pack of 6, etc.
+    .replace(/\b(x\d+|\d+\s*-?\s*pack|pack\s*of\s*\d+|\d+\s*x\s*\d+)\b/gi, '')
+    // Remove common suffixes that are just packaging variants
+    .replace(/\b(can|bottle|pet|glass|tetra|carton|pouch|sachet|box|tin)\b/gi, '')
+    // Remove trailing numbers (often product codes)
+    .replace(/\s+\d+$/, '')
+    // Collapse whitespace
+    .replace(/\s+/g, ' ')
+    .trim()
+  const brandNorm = normalizeBrand(brand)
+  return `${brandNorm}|${normalized}`
+}
+
+/**
+ * Common product aliases for better search
+ */
+const PRODUCT_ALIASES: Record<string, string[]> = {
+  'coke': ['coca cola', 'coca-cola'],
+  'pepsi': ['pepsico', 'pepsi cola'],
+  'maggi': ['maggi noodles', 'nestle maggi'],
+  'oreo': ['oreo cookies', 'oreo biscuit'],
+  'lays': ['lay\'s', 'lays chips'],
+  'doritos': ['doritos chips', 'doritos nacho'],
+  'sprite': ['sprite soda', 'coca cola sprite'],
+  'fanta': ['fanta orange', 'coca cola fanta'],
+  'kitkat': ['kit kat', 'nestle kitkat'],
+  'nescafe': ['nescafé', 'nestle nescafe'],
+  'cheetos': ['cheetos puffs', 'cheetos chips'],
+  'redbull': ['red bull'],
+  'red bull': ['redbull energy drink'],
+  'mtn dew': ['mountain dew'],
+  'mountain dew': ['mtn dew', 'pepsico mountain dew'],
+  'pb': ['peanut butter'],
+  'oj': ['orange juice'],
+  'choco': ['chocolate'],
+  'biscuit': ['biscuits', 'cookies'],
+  'chips': ['potato chips', 'crisps'],
+  'dahi': ['yogurt', 'curd'],
+  'atta': ['wheat flour', 'whole wheat flour'],
+  'dal': ['lentils', 'pulses'],
+  'ghee': ['clarified butter', 'desi ghee'],
+  'paneer': ['cottage cheese', 'paneer fresh'],
+  'parle': ['parle-g', 'parle biscuits'],
+  'amul': ['amul butter', 'amul milk'],
+  'haldiram': ['haldiram\'s', 'haldiram snacks'],
+  'britannia': ['britannia biscuits', 'britannia bread'],
+  'thums up': ['thumbs up', 'thums up cola'],
+  'limca': ['limca lemon', 'coca cola limca'],
+  'frooti': ['frooti mango', 'parle frooti'],
+  'maaza': ['maaza mango', 'coca cola maaza'],
+}
+
+/**
+ * Generate search term variations locally (with alias expansion)
+ */
+function generateSearchTerms(query: string): string[] {
+  const terms = [query]
+  const queryLower = query.toLowerCase().trim()
+  
+  // Check for aliases
+  const aliases = PRODUCT_ALIASES[queryLower]
+  if (aliases) {
+    terms.push(...aliases)
+  }
+  
+  // Also check partial matches (e.g., "coke zero" should still expand "coke")
+  for (const [alias, expansions] of Object.entries(PRODUCT_ALIASES)) {
+    if (queryLower !== alias && queryLower.includes(alias)) {
+      for (const exp of expansions) {
+        terms.push(queryLower.replace(alias, exp))
+      }
+    }
+  }
+  
+  const words = query.split(/\s+/).filter(Boolean)
+  // Add individual words as separate terms if multi-word query
+  if (words.length > 1) {
+    terms.push(words[0]) // brand name usually comes first
+    terms.push(words.slice(1).join(' ')) // product type
+  }
+  
+  // Deduplicate
+  return [...new Set(terms.map(t => t.toLowerCase()))].slice(0, 5)
+}
 
 interface OpenFoodFactsProduct {
   product: {
     product_name?: string
+    product_name_en?: string
     brands?: string
     categories?: string
+    categories_tags_en?: string[]
     ingredients_text?: string
+    ingredients_text_en?: string
     ingredients?: Array<{
       id: string
       text: string
@@ -152,23 +351,31 @@ function fuzzyMatch(query: string, text: string): number {
 }
 
 export async function fetchProductByBarcode(barcode: string): Promise<ProductAnalysis> {
-  try {
-    const response = await fetch(`${OPEN_FOOD_FACTS_API}/product/${barcode}.json`)
-    
-    if (!response.ok) {
-      throw new Error('Product not found')
+  const urls = [
+    `${OPEN_FOOD_FACTS_API}/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`,
+    `${OPEN_FOOD_FACTS_DIRECT}/api/v2/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`,
+  ]
+  
+  for (const url of urls) {
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 8000)
+      const response = await fetch(url, { signal: controller.signal })
+      clearTimeout(timeout)
+      
+      if (!response.ok) continue
+      
+      const data: OpenFoodFactsProduct = await response.json()
+      
+      if (data.status !== 1 || !data.product) continue
+      
+      return parseOpenFoodFactsProduct(data)
+    } catch {
+      // Try next URL
     }
-    
-    const data: OpenFoodFactsProduct = await response.json()
-    
-    if (data.status !== 1 || !data.product) {
-      throw new Error('Product not found')
-    }
-    
-    return parseOpenFoodFactsProduct(data)
-  } catch (error) {
-    throw new Error('Failed to fetch product from API')
   }
+  
+  throw new Error('Product not found. Please check the barcode and try again.')
 }
 
 export async function searchProductsByName(query: string): Promise<ProductAnalysis[]> {
@@ -179,39 +386,25 @@ export async function searchProductsByName(query: string): Promise<ProductAnalys
   try {
     const searchQuery = query.trim()
     
-    const promptText = `You are a food product search assistant. Given the user's search query, generate 3-5 optimal search terms that would help find relevant food products in a database. Consider brand names, product types, and common variations.
-
-User query: "${searchQuery}"
-
-Return a JSON object with a "terms" property containing an array of search terms. Example: {"terms": ["maggi noodles", "maggi", "instant noodles"]}`
-    
-    const aiPrompt = window.spark.llmPrompt([promptText] as any, searchQuery)
-    
-    let searchTerms = [searchQuery]
-    try {
-      const aiResult = await window.spark.llm(aiPrompt, 'gpt-4o', true)
-      const parsed = JSON.parse(aiResult)
-      if (parsed.terms && Array.isArray(parsed.terms)) {
-        searchTerms = parsed.terms
+    // Use AI to understand natural language and fix typos if available
+    let searchTerms: string[]
+    if (isAIEnabled()) {
+      try {
+        const aiResult = await smartSearchQuery(searchQuery)
+        searchTerms = [aiResult.correctedQuery, ...aiResult.searchTerms]
+        // Deduplicate
+        searchTerms = [...new Set(searchTerms.map(t => t.toLowerCase()))]
+      } catch {
+        searchTerms = generateSearchTerms(searchQuery)
       }
-    } catch (e) {
-      console.log('Using original search term')
+    } else {
+      searchTerms = generateSearchTerms(searchQuery)
     }
     
     const allResults = new Map<string, ProductAnalysis>()
     
     for (const term of searchTerms.slice(0, 3)) {
-      const encodedQuery = encodeURIComponent(term)
-      
-      const response = await fetch(
-        `${OPEN_FOOD_FACTS_API}/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=50&json=true&fields=code,product_name,brands,categories,ingredients_text,ingredients,nutriscore_grade,image_url,nutriments,additives_tags,allergens`
-      )
-      
-      if (!response.ok) {
-        continue
-      }
-      
-      const data = await response.json()
+      const data = await searchOpenFoodFacts(term, SEARCH_FIELDS, 50)
       const results = parseSearchResults(data)
       
       results.forEach(product => {
@@ -222,6 +415,8 @@ Return a JSON object with a "terms" property containing an array of search terms
     }
     
     const results = Array.from(allResults.values())
+      // Filter: English product names only
+      .filter(product => isEnglishName(product.productName))
     
     const scoredResults = results.map(product => {
       const productText = `${product.productName} ${product.brand || ''} ${product.category || ''}`
@@ -237,8 +432,16 @@ Return a JSON object with a "terms" property containing an array of search terms
     
     scoredResults.sort((a, b: any) => b.score - a.score)
     
+    // Dedup: one item per brand + product + flavour (strip sizes/packaging)
+    const seenKeys = new Set<string>()
     return scoredResults
       .filter(r => r.score > 10)
+      .filter(r => {
+        const key = normalizeProductKey(r.product.productName, r.product.brand || '')
+        if (seenKeys.has(key)) return false
+        seenKeys.add(key)
+        return true
+      })
       .slice(0, 30)
       .map((r: any) => r.product)
   } catch (error) {
@@ -247,43 +450,49 @@ Return a JSON object with a "terms" property containing an array of search terms
   }
 }
 
-export async function getSearchSuggestions(query: string): Promise<string[]> {
+export async function getSearchSuggestions(query: string): Promise<{ product: string; brand: string }[]> {
   if (!query || query.trim().length < 2) {
     return []
   }
 
   try {
-    const encodedQuery = encodeURIComponent(query.trim())
+    // Search with alias expansion for better results
+    const searchTerms = generateSearchTerms(query.trim()).slice(0, 3)
+    const seen = new Set<string>()
+    const results: { product: string; brand: string }[] = []
     
-    // Use the search API with small page size for fast autocomplete
-    const response = await fetch(
-      `${OPEN_FOOD_FACTS_API}/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=8&json=true&fields=product_name,brands`
+    // Search all terms in parallel for speed
+    const promises = searchTerms.map(term => 
+      searchOpenFoodFacts(term, SUGGEST_FIELDS, 10).catch(() => ({ products: [] }))
     )
+    const allData = await Promise.all(promises)
     
-    if (!response.ok) {
-      return []
-    }
-    
-    const data = await response.json()
-    const suggestions = new Set<string>()
-    
-    if (data.products && Array.isArray(data.products)) {
-      for (const product of data.products) {
-        if (product.product_name) {
-          suggestions.add(product.product_name)
-        }
-        if (product.brands && product.product_name) {
-          suggestions.add(`${product.brands} - ${product.product_name}`)
+    for (const data of allData) {
+      if (data.products && Array.isArray(data.products)) {
+        for (const p of data.products) {
+          // Prefer English name; skip if neither name is English
+          const nameEn = p.product_name_en?.trim()
+          const nameRaw = p.product_name?.trim()
+          const name = (nameEn && isEnglishName(nameEn)) ? nameEn : (nameRaw && isEnglishName(nameRaw)) ? nameRaw : null
+          if (!name) continue
+          const brand = p.brands?.split(',')[0]?.trim() || ''
+          // Also reject brands with non-Latin scripts
+          if (/[\u0400-\u04FF\u0600-\u06FF\u3000-\u9FFF\uAC00-\uD7AF\u0E00-\u0E7F\u0900-\u097F\u0590-\u05FF]/.test(brand)) continue
+          // Dedup: one item per brand + product + flavour (strip sizes/packaging)
+          const dedupKey = normalizeProductKey(name, brand)
+          if (seen.has(dedupKey)) continue
+          seen.add(dedupKey)
+          results.push({ product: name, brand })
         }
       }
     }
     
-    // Sort by fuzzy relevance
+    // Sort by fuzzy relevance to the original query
     const queryLower = query.toLowerCase()
-    return Array.from(suggestions)
+    return results
       .sort((a, b) => {
-        const aScore = fuzzyMatch(queryLower, a)
-        const bScore = fuzzyMatch(queryLower, b)
+        const aScore = fuzzyMatch(queryLower, a.product) + (a.brand ? fuzzyMatch(queryLower, a.brand) * 0.5 : 0)
+        const bScore = fuzzyMatch(queryLower, b.product) + (b.brand ? fuzzyMatch(queryLower, b.brand) * 0.5 : 0)
         return bScore - aScore
       })
       .slice(0, 8)
@@ -309,6 +518,45 @@ function parseSearchResults(data: any): ProductAnalysis[] {
     .filter((p: ProductAnalysis | null): p is ProductAnalysis => p !== null)
 }
 
+/**
+ * Pick the best English category from categories_tags_en, avoiding French/dashed slugs
+ */
+function getBestCategory(tagsEn?: string[], rawCategories?: string): string | undefined {
+  if (tagsEn && tagsEn.length > 0) {
+    // Filter out entries with language prefixes like "pt:" "fr:" etc.
+    const cleaned = tagsEn
+      .filter(t => !t.match(/^[a-z]{2}:/))
+      .map(t => t.trim())
+      .filter(Boolean)
+    
+    // Prefer entries that look like proper English (contain spaces, no hyphens between words)
+    const properEnglish = cleaned.filter(t => t.includes(' ') && !t.match(/^[a-z]+-[a-z]+-/i))
+    
+    if (properEnglish.length > 0) {
+      // Pick the most specific (last) proper English category
+      return properEnglish[properEnglish.length - 1]
+    }
+    
+    // If all are dashed slugs, convert the most specific one to readable form
+    if (cleaned.length > 0) {
+      const best = cleaned[cleaned.length - 1]
+      return best
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+    }
+  }
+  
+  // Fallback to raw categories field
+  if (rawCategories) {
+    const parts = rawCategories.split(',').map(s => s.trim()).filter(Boolean)
+    // Try to find an English-looking one (no accented characters)
+    const english = parts.find(p => !/[àâéèêëïîôùûüÿçæœ]/i.test(p))
+    return english || parts[0]
+  }
+  
+  return undefined
+}
+
 function parseOpenFoodFactsProduct(data: OpenFoodFactsProduct): ProductAnalysis {
   const product = data.product
   
@@ -316,7 +564,7 @@ function parseOpenFoodFactsProduct(data: OpenFoodFactsProduct): ProductAnalysis 
     throw new Error('Invalid product data')
   }
   
-  const ingredientsText = product.ingredients_text || ''
+  const ingredientsText = product.ingredients_text_en || product.ingredients_text || ''
   const ingredients = analyzeIngredients(ingredientsText, product.ingredients || [])
   
   const score = calculateProductScore(ingredients, product)
@@ -326,10 +574,10 @@ function parseOpenFoodFactsProduct(data: OpenFoodFactsProduct): ProductAnalysis 
   
   return {
     id: product.code || Date.now().toString(),
-    productName: product.product_name,
+    productName: product.product_name_en || product.product_name,
     barcode: product.code,
     brand: product.brands,
-    category: product.categories?.split(',')[0]?.trim(),
+    category: getBestCategory(product.categories_tags_en, product.categories),
     overallScore: score,
     ingredients,
     dietaryType,
@@ -575,6 +823,51 @@ function calculateProductScore(ingredients: Ingredient[], product: any): number 
   return Math.max(0, Math.min(100, Math.round(score)))
 }
 
+/**
+ * Generate a human-readable explanation of why the product got its score
+ */
+export function generateScoreSummary(analysis: ProductAnalysis, product?: any): string[] {
+  const reasons: string[] = []
+  const score = analysis.overallScore
+
+  // Score label
+  if (score >= 80) reasons.push('Excellent overall health profile')
+  else if (score >= 60) reasons.push('Good health profile with some concerns')
+  else if (score >= 40) reasons.push('Fair health profile — moderate concerns')
+  else if (score >= 20) reasons.push('Poor health profile — significant concerns')
+  else reasons.push('Very poor health profile — many health concerns')
+
+  // Ingredient-based reasons
+  const naturalCount = analysis.ingredients.filter(i => i.source === 'natural').length
+  const syntheticCount = analysis.ingredients.filter(i => i.source === 'synthetic').length
+  const total = analysis.ingredients.length
+
+  if (total > 0) {
+    const naturalPct = Math.round((naturalCount / total) * 100)
+    if (naturalPct > 80) reasons.push(`${naturalPct}% natural ingredients — very clean formula`)
+    else if (naturalPct > 60) reasons.push(`${naturalPct}% natural ingredients — mostly clean`)
+    else if (naturalPct < 40) reasons.push(`Only ${naturalPct}% natural ingredients — heavily processed`)
+    
+    if (syntheticCount > 3) reasons.push(`Contains ${syntheticCount} synthetic additives`)
+    else if (syntheticCount > 0) reasons.push(`Contains ${syntheticCount} synthetic additive(s)`)
+  }
+
+  // Warning-based reasons
+  for (const w of analysis.warnings.slice(0, 3)) {
+    if (w.toLowerCase().includes('sugar')) reasons.push('High sugar content lowers the score')
+    else if (w.toLowerCase().includes('saturated fat')) reasons.push('High saturated fat reduces the score')
+    else if (w.toLowerCase().includes('sodium') || w.toLowerCase().includes('salt')) reasons.push('High sodium/salt content is a concern')
+    else if (w.toLowerCase().includes('allergen')) reasons.push('Contains common allergens')
+  }
+
+  // Benefits
+  if (analysis.benefits.length > 0) {
+    reasons.push(`${analysis.benefits.length} positive health factor(s) boost the score`)
+  }
+
+  return reasons
+}
+
 function determineDietaryType(ingredients: Ingredient[], product: any): DietaryType {
   const hasNonVeg = ingredients.some(i => i.dietaryType === 'non-veg')
   
@@ -681,17 +974,8 @@ export async function getAlternatives(productAnalysis: ProductAnalysis): Promise
   
   try {
     const category = productAnalysis.category.split(',')[0].trim()
-    const encodedCategory = encodeURIComponent(category)
     
-    const response = await fetch(
-      `${OPEN_FOOD_FACTS_API}/category/${encodedCategory}.json?page_size=30`
-    )
-    
-    if (!response.ok) {
-      return []
-    }
-    
-    const data = await response.json()
+    const data = await searchOpenFoodFacts(category, SEARCH_FIELDS, 30)
     const alternatives: Alternative[] = []
     
     if (data.products && Array.isArray(data.products)) {
@@ -699,7 +983,8 @@ export async function getAlternatives(productAnalysis: ProductAnalysis): Promise
         .filter((p: any) => 
           p.product_name && 
           p.code !== productAnalysis.barcode &&
-          p.product_name !== productAnalysis.productName
+          p.product_name !== productAnalysis.productName &&
+          isEnglishName(p.product_name_en || p.product_name)
         )
         .map((product: any) => {
           try {
@@ -710,16 +995,25 @@ export async function getAlternatives(productAnalysis: ProductAnalysis): Promise
         })
         .filter((p: any): p is ProductAnalysis => p !== null)
       
+      // Dedup: one item per brand + product + flavour
+      const seenKeys = new Set<string>()
+      const dedupedProducts = parsedProducts.filter((p: ProductAnalysis) => {
+        const key = normalizeProductKey(p.productName, p.brand || '')
+        if (seenKeys.has(key)) return false
+        seenKeys.add(key)
+        return true
+      })
+      
       // For low-score products, show better alternatives
       // For high-score products, show similar good products
       let selectedProducts: ProductAnalysis[]
       if (productAnalysis.overallScore < 70) {
-        selectedProducts = parsedProducts
+        selectedProducts = dedupedProducts
           .filter((p: ProductAnalysis) => p.overallScore > productAnalysis.overallScore)
           .sort((a: ProductAnalysis, b: ProductAnalysis) => b.overallScore - a.overallScore)
           .slice(0, 5)
       } else {
-        selectedProducts = parsedProducts
+        selectedProducts = dedupedProducts
           .filter((p: ProductAnalysis) => p.overallScore >= 60)
           .sort((a: ProductAnalysis, b: ProductAnalysis) => b.overallScore - a.overallScore)
           .slice(0, 5)
@@ -748,63 +1042,35 @@ export async function getAlternatives(productAnalysis: ProductAnalysis): Promise
   }
 }
 
-export async function analyzeIngredientImage(imageData: string): Promise<string> {
-  const promptText = `You are an expert at reading food ingredient labels from images. 
-  
-Extract the complete ingredients list from this image. Return ONLY the comma-separated list of ingredients, nothing else.
-
-If you cannot read the ingredients clearly, return "UNREADABLE".
-
-Image: ${imageData}`
-  
-  const prompt = window.spark.llmPrompt([promptText] as any)
-
-  try {
-    const result = await window.spark.llm(prompt, 'gpt-4o')
-    return result.trim()
-  } catch (error) {
-    throw new Error('Failed to analyze ingredient image')
-  }
+export async function analyzeIngredientImage(_imageData: string): Promise<string> {
+  // Without AI, image analysis is not available locally
+  throw new Error('Image ingredient analysis requires an AI service. Please enter ingredients manually.')
 }
 
 export async function analyzeIngredientsWithAI(ingredientsText: string): Promise<Ingredient[]> {
-  const promptText = `Analyze the following food ingredients list and provide detailed safety and nutritional information for each ingredient.
+  // Parse ingredients locally without AI
+  const ingredientNames = ingredientsText
+    .split(/[,;]/)
+    .map(s => s.trim())
+    .filter(Boolean)
 
-Ingredients: ${ingredientsText}
+  return ingredientNames.map(name => ({
+    name,
+    dietaryType: 'veg' as DietaryType,
+    source: classifyIngredientSource(name),
+    pregnancySafe: 'caution' as SafetyLevel,
+    kidSafe: 'safe' as SafetyLevel,
+    healthImpact: '',
+    benefits: [],
+    concerns: []
+  }))
+}
 
-For each ingredient, determine:
-1. Is it vegetarian, non-vegetarian, or vegan?
-2. Is it natural, processed, or synthetic?
-3. Is it safe during pregnancy (safe/caution/avoid)?
-4. Is it safe for children (safe/caution/avoid)?
-5. Health benefits (if any)
-6. Health concerns (if any)
-7. Overall health impact summary
-
-Return the result as a valid JSON object with a single property "ingredients" containing an array of ingredient objects.`
-
-  const prompt = window.spark.llmPrompt([promptText] as any)
-
-  try {
-    const result = await window.spark.llm(prompt, 'gpt-4o', true)
-    const parsed = JSON.parse(result)
-    
-    if (parsed.ingredients && Array.isArray(parsed.ingredients)) {
-      return parsed.ingredients.map((ing: any) => ({
-        name: ing.name || 'Unknown',
-        dietaryType: ing.dietaryType || 'veg',
-        source: ing.source || 'natural',
-        pregnancySafe: ing.pregnancySafe || 'caution',
-        kidSafe: ing.kidSafe || 'caution',
-        healthImpact: ing.healthImpact || 'Unknown',
-        benefits: ing.benefits || [],
-        concerns: ing.concerns || []
-      }))
-    }
-    
-    return []
-  } catch (error) {
-    console.error('AI analysis failed:', error)
-    return []
-  }
+function classifyIngredientSource(name: string): IngredientSource {
+  const synthetic = ['e1', 'e2', 'e3', 'e4', 'e5', 'e6', 'e9', 'artificial', 'color', 'colour', 'flavor', 'flavour', 'preservative', 'aspartame', 'sucralose', 'acesulfame', 'bht', 'bha', 'tbhq', 'msg', 'sodium benzoate', 'potassium sorbate']
+  const processed = ['refined', 'hydrogenated', 'modified', 'maltodextrin', 'corn syrup', 'high fructose', 'palm oil', 'soy lecithin', 'mono and diglycerides', 'carrageenan']
+  const lower = name.toLowerCase()
+  if (synthetic.some(s => lower.includes(s))) return 'synthetic'
+  if (processed.some(p => lower.includes(p))) return 'processed'
+  return 'natural'
 }

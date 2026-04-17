@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { useKV } from '@github/spark/hooks'
-import { Barcode, MagnifyingGlass, ClockCounterClockwise, SlidersHorizontal, Camera, Sparkle, ArrowsLeftRight, TrendUp, CurrencyInr, Baby, X, SignOut, User as UserIcon, CircleNotch } from '@phosphor-icons/react'
+import { useKV } from '@/hooks/use-kv'
+import { Barcode, MagnifyingGlass, ClockCounterClockwise, SlidersHorizontal, Camera, Sparkle, ArrowsLeftRight, TrendUp, CurrencyInr, Baby, X, SignOut, User as UserIcon, CircleNotch, CheckCircle, Brain } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -14,13 +14,14 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { toast } from 'sonner'
+import { toast, Toaster } from 'sonner'
 import { ScoreGauge } from '@/components/ScoreGauge'
 import { IngredientList } from '@/components/IngredientList'
 import { BarcodeScanner } from '@/components/BarcodeScanner'
 import { AuthDialog } from '@/components/AuthDialog'
 import type { ProductAnalysis, UserPreferences, Alternative, ScanHistoryItem, UserProfile } from '@/lib/types'
-import { fetchProductByBarcode, searchProductsByName, getAlternatives, getSearchSuggestions } from '@/lib/api'
+import { fetchProductByBarcode, searchProductsByName, getAlternatives, getSearchSuggestions, generateScoreSummary } from '@/lib/api'
+import { analyzeIngredientsAI, getAIRecommendation, setApiKey, getStoredApiKey, isAIEnabled } from '@/lib/ai'
 import { filterByPreferences } from '@/lib/analysis'
 import { motion, AnimatePresence } from 'framer-motion'
 
@@ -37,10 +38,14 @@ function App() {
   const [showScanner, setShowScanner] = useState(false)
   const [showAuthDialog, setShowAuthDialog] = useState(false)
   const [isLoadingAlternatives, setIsLoadingAlternatives] = useState(false)
-  const [searchSuggestions, setSearchSuggestions] = useState<string[]>([])
+  const [searchSuggestions, setSearchSuggestions] = useState<{ product: string; brand: string }[]>([])
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [loadingAlternativesFor, setLoadingAlternativesFor] = useState<Set<string>>(new Set())
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const [aiAnalysis, setAiAnalysis] = useState<{ summary: string; healthRating: string; concerns: string[]; benefits: string[]; recommendation: string } | null>(null)
+  const [aiRecommendation, setAiRecommendation] = useState<string>('')
+  const [apiKeyInput, setApiKeyInput] = useState(getStoredApiKey())
+  const [aiEnabled, setAiEnabled] = useState(isAIEnabled())
   
   const [userProfile, setUserProfile] = useKV<UserProfile | null>('user-profile', null)
   const [userScanHistory = [], setUserScanHistory] = useKV<ScanHistoryItem[]>('user-scan-history', [])
@@ -143,6 +148,8 @@ function App() {
     try {
       const analysis = await fetchProductByBarcode(barcode)
       setCurrentAnalysis(analysis)
+      setAiAnalysis(null)
+      setAiRecommendation('')
       
       addToHistory(analysis)
       
@@ -152,6 +159,17 @@ function App() {
       }
       
       toast.success('Product analyzed successfully!')
+      
+      // Run AI analysis in background if enabled
+      if (isAIEnabled()) {
+        const ingredientsText = analysis.ingredients.map(i => i.name).join(', ')
+        analyzeIngredientsAI(ingredientsText, analysis.productName)
+          .then(result => setAiAnalysis(result))
+          .catch(() => {})
+        getAIRecommendation(analysis.productName, analysis.overallScore, analysis.warnings, analysis.category || '')
+          .then(result => setAiRecommendation(result))
+          .catch(() => {})
+      }
       
       if (fromTab) {
         setPreviousTab(fromTab)
@@ -245,8 +263,8 @@ function App() {
     toast.success('Signed out successfully')
   }
 
-  const handleSuggestionSelect = (suggestion: string) => {
-    setSearchQuery(suggestion)
+  const handleSuggestionSelect = (suggestion: { product: string; brand: string }) => {
+    setSearchQuery(suggestion.product)
     setShowSuggestions(false)
     setTimeout(() => {
       handleSearch()
@@ -478,6 +496,49 @@ function App() {
                       </div>
                     </div>
                   </div>
+
+                  <Separator />
+
+                  <div className="space-y-3">
+                    <Label className="flex items-center gap-2 text-base font-semibold">
+                      <Sparkle size={16} />
+                      AI Analysis (Gemini)
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Add a free Google Gemini API key for AI-powered ingredient analysis, smart search with typo correction, and personalized health recommendations.
+                    </p>
+                    <div className="flex gap-2">
+                      <Input
+                        type="password"
+                        placeholder="Paste Gemini API key"
+                        value={apiKeyInput}
+                        onChange={(e) => setApiKeyInput(e.target.value)}
+                      />
+                      <Button
+                        size="sm"
+                        onClick={() => {
+                          setApiKey(apiKeyInput)
+                          setAiEnabled(apiKeyInput.length > 10)
+                          toast.success(apiKeyInput.length > 10 ? 'AI enabled!' : 'AI disabled')
+                        }}
+                      >
+                        Save
+                      </Button>
+                    </div>
+                    {aiEnabled && (
+                      <p className="text-xs text-green-600 flex items-center gap-1">
+                        <CheckCircle size={12} /> AI analysis active
+                      </p>
+                    )}
+                    <a
+                      href="https://aistudio.google.com/apikey"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-primary underline"
+                    >
+                      Get a free Gemini API key →
+                    </a>
+                  </div>
                 </div>
               </SheetContent>
             </Sheet>
@@ -598,6 +659,21 @@ function App() {
                       <p className="text-sm text-muted-foreground mt-4">Overall Health Score</p>
                     </div>
 
+                    {/* Score Summary */}
+                    <div className="rounded-lg bg-muted/50 border p-4">
+                      <h3 className="font-semibold mb-2 text-sm">Why this score?</h3>
+                      <ul className="space-y-1">
+                        {generateScoreSummary(currentAnalysis).map((reason, i) => (
+                          <li key={i} className="text-sm text-muted-foreground flex items-start gap-2">
+                            <span className="mt-1 text-xs">
+                              {i === 0 ? '📊' : reason.includes('boost') || reason.includes('clean') || reason.includes('natural') ? '✅' : '⚠️'}
+                            </span>
+                            {reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+
                     {currentAnalysis.warnings.length > 0 && (
                       <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-4">
                         <h3 className="font-semibold text-destructive mb-2 flex items-center gap-2">
@@ -623,6 +699,45 @@ function App() {
                       </div>
                     )}
 
+                    {(aiAnalysis || aiRecommendation) && (
+                      <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 space-y-3">
+                        <h3 className="font-semibold flex items-center gap-2 text-primary">
+                          <Brain size={18} />
+                          AI Health Analysis
+                        </h3>
+                        {aiAnalysis && (
+                          <>
+                            <p className="text-sm">{aiAnalysis.summary}</p>
+                            {aiAnalysis.concerns.length > 0 && (
+                              <div>
+                                <p className="text-xs font-medium text-destructive mb-1">Concerns:</p>
+                                <ul className="space-y-0.5">
+                                  {aiAnalysis.concerns.map((c, i) => (
+                                    <li key={i} className="text-xs text-destructive/80">• {c}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {aiAnalysis.benefits.length > 0 && (
+                              <div>
+                                <p className="text-xs font-medium text-green-600 mb-1">Benefits:</p>
+                                <ul className="space-y-0.5">
+                                  {aiAnalysis.benefits.map((b, i) => (
+                                    <li key={i} className="text-xs text-green-600/80">• {b}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </>
+                        )}
+                        {aiRecommendation && (
+                          <p className="text-sm italic text-muted-foreground border-t border-primary/10 pt-2">
+                            💡 {aiRecommendation}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     <div>
                       <h3 className="font-semibold mb-3">Ingredients Analysis</h3>
                       <IngredientList ingredients={currentAnalysis.ingredients} />
@@ -630,8 +745,7 @@ function App() {
                   </CardContent>
                 </Card>
 
-                {(alternatives.length > 0 || isLoadingAlternatives) && (
-                  <Card className="border-accent">
+                <Card className="border-accent">
                     <CardHeader>
                       <CardTitle className="flex items-center gap-2 text-accent">
                         <ArrowsLeftRight size={24} />
@@ -716,8 +830,7 @@ function App() {
                         </div>
                       )}
                     </CardContent>
-                  </Card>
-                )}
+                </Card>
               </motion.div>
             )}
           </TabsContent>
@@ -734,42 +847,39 @@ function App() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <Popover open={showSuggestions} onOpenChange={setShowSuggestions}>
-                  <PopoverTrigger asChild>
-                    <div className="flex gap-2">
-                      <div className="flex-1 relative">
-                        <Input
-                          placeholder="Search products (e.g., Maggi, Oats, Ghee, Coca Cola)"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                          onFocus={() => searchSuggestions.length > 0 && setShowSuggestions(true)}
-                        />
+                <div className="flex gap-2">
+                  <div className="flex-1 relative">
+                    <Input
+                      placeholder="Search products (e.g., Maggi, Oats, Ghee, Coca Cola)"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                      onFocus={() => searchSuggestions.length > 0 && setShowSuggestions(true)}
+                      onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
+                    />
+                    {showSuggestions && searchSuggestions.length > 0 && (
+                      <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border border-border rounded-lg shadow-lg overflow-hidden">
+                        {searchSuggestions.map((suggestion, i) => (
+                          <button
+                            key={i}
+                            className="w-full text-left px-3 py-2 hover:bg-accent/10 flex items-center gap-2 transition-colors"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => handleSuggestionSelect(suggestion)}
+                          >
+                            <MagnifyingGlass size={14} className="text-muted-foreground flex-shrink-0" />
+                            <span className="truncate text-sm font-medium">{suggestion.product}</span>
+                            {suggestion.brand && (
+                              <span className="text-xs text-muted-foreground flex-shrink-0">• {suggestion.brand}</span>
+                            )}
+                          </button>
+                        ))}
                       </div>
-                      <Button onClick={handleSearch} disabled={isLoading}>
-                        {isLoading ? <CircleNotch size={20} className="animate-spin" /> : 'Search'}
-                      </Button>
-                    </div>
-                  </PopoverTrigger>
-                  <PopoverContent className="w-[400px] p-0" align="start">
-                    <Command>
-                      <CommandList>
-                        <CommandEmpty>No suggestions</CommandEmpty>
-                        <CommandGroup heading="Suggestions">
-                          {searchSuggestions.map((suggestion, i) => (
-                            <CommandItem
-                              key={i}
-                              onSelect={() => handleSuggestionSelect(suggestion)}
-                            >
-                              <MagnifyingGlass size={16} className="mr-2" />
-                              {suggestion}
-                            </CommandItem>
-                          ))}
-                        </CommandGroup>
-                      </CommandList>
-                    </Command>
-                  </PopoverContent>
-                </Popover>
+                    )}
+                  </div>
+                  <Button onClick={handleSearch} disabled={isLoading}>
+                    {isLoading ? <CircleNotch size={20} className="animate-spin" /> : 'Search'}
+                  </Button>
+                </div>
               </CardContent>
             </Card>
 
@@ -952,6 +1062,7 @@ function App() {
         <p>Safe Bite • Powered by Open Food Facts API • AI-Powered Analysis</p>
       </footer>
     </div>
+    <Toaster position="top-center" richColors />
     </>
   )
 }
