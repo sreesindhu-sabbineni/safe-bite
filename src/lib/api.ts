@@ -3,6 +3,7 @@ import { isAIEnabled, smartSearchQuery } from './ai'
 
 const OPEN_FOOD_FACTS_API = '/api/off/api/v2'
 const OPEN_FOOD_FACTS_DIRECT = 'https://world.openfoodfacts.org'
+const IS_DEV = import.meta.env.DEV
 const SEARCH_FIELDS = 'code,product_name,product_name_en,brands,categories,categories_tags_en,ingredients_text,ingredients_text_en,ingredients,nutriscore_grade,image_url,nutriments,additives_tags,allergens'
 const SUGGEST_FIELDS = 'product_name,product_name_en,brands,image_url,code'
 
@@ -12,16 +13,21 @@ const SUGGEST_FIELDS = 'product_name,product_name_en,brands,image_url,code'
 async function searchOpenFoodFacts(query: string, fields: string, pageSize: number): Promise<any> {
   const encodedQuery = encodeURIComponent(query)
   
-  const urls = [
-    // 1. Proxy → v2 API
-    `${OPEN_FOOD_FACTS_API}/search?search_terms=${encodedQuery}&page_size=${pageSize}&lc=en&fields=${fields}`,
-    // 2. Proxy → cgi search
-    `/api/off/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=${pageSize}&json=true&lc=en&fields=${fields}`,
-    // 3. Direct → v2 API (CORS may block but works in some browsers)
+  const urls: string[] = []
+  
+  // Proxy URLs only work with Vite dev server
+  if (IS_DEV) {
+    urls.push(
+      `${OPEN_FOOD_FACTS_API}/search?search_terms=${encodedQuery}&page_size=${pageSize}&lc=en&fields=${fields}`,
+      `/api/off/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=${pageSize}&json=true&lc=en&fields=${fields}`,
+    )
+  }
+  
+  // Direct URLs work everywhere (Open Food Facts supports CORS)
+  urls.push(
     `${OPEN_FOOD_FACTS_DIRECT}/api/v2/search?search_terms=${encodedQuery}&page_size=${pageSize}&lc=en&fields=${fields}`,
-    // 4. Direct → cgi search
     `${OPEN_FOOD_FACTS_DIRECT}/cgi/search.pl?search_terms=${encodedQuery}&search_simple=1&action=process&page_size=${pageSize}&json=true&lc=en&fields=${fields}`,
-  ]
+  )
   
   for (const url of urls) {
     try {
@@ -351,10 +357,11 @@ function fuzzyMatch(query: string, text: string): number {
 }
 
 export async function fetchProductByBarcode(barcode: string): Promise<ProductAnalysis> {
-  const urls = [
-    `${OPEN_FOOD_FACTS_API}/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`,
-    `${OPEN_FOOD_FACTS_DIRECT}/api/v2/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`,
-  ]
+  const urls: string[] = []
+  if (IS_DEV) {
+    urls.push(`${OPEN_FOOD_FACTS_API}/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`)
+  }
+  urls.push(`${OPEN_FOOD_FACTS_DIRECT}/api/v2/product/${barcode}?lc=en&fields=${SEARCH_FIELDS}`)
   
   for (const url of urls) {
     try {
